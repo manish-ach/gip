@@ -1,3 +1,4 @@
+use flate2::read::GzDecoder;
 use reqwest::{
     blocking::Client,
     header::{HeaderMap, HeaderValue},
@@ -7,8 +8,10 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{self, BufRead, BufReader},
+    os::unix::fs::symlink,
     path::PathBuf,
 };
+use tar::Archive;
 
 #[derive(Debug, Deserialize)]
 struct PackageDB {
@@ -26,6 +29,11 @@ struct Version {
     url: String,
     checksum: String,
     manifest: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    bin: String,
 }
 
 struct EnvVars {
@@ -83,8 +91,7 @@ pub fn load_env(path: &str) -> io::Result<HashMap<String, String>> {
 
 fn refresh_packages_db(env_config: &EnvVars) -> Result<(), String> {
     let client = Client::new();
-    let url =
-        "https://raw.githubusercontent.com/manish-ach/gip/refs/heads/main/packages/packages.json";
+    let url = "https://raw.githubusercontent.com/manish-ach/packages/refs/heads/main/packages.json";
     let mut headers = HeaderMap::new();
     let header_value = HeaderValue::from_str(&format!("token {}", env_config.pat)).unwrap();
     headers.insert(reqwest::header::AUTHORIZATION, header_value);
@@ -102,6 +109,71 @@ fn refresh_packages_db(env_config: &EnvVars) -> Result<(), String> {
     std::fs::create_dir_all(package_file.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(package_file, bytes).map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+fn fetch_manifest<T: serde::de::DeserializeOwned>(url: &str, pat: &str) -> Result<T, String> {
+    let client = Client::new();
+    let mut headers = HeaderMap::new();
+    let token = format!("token {}", pat);
+    let header_value = HeaderValue::from_str(&token).unwrap();
+    headers.insert(reqwest::header::AUTHORIZATION, header_value);
+
+    let res = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let bytes = res.bytes().map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn download_bin(name: &str, url: &str, pat: &str) -> Result<(), String> {
+    let client = Client::new();
+    let mut headers = HeaderMap::new();
+    let token = format!("token {}", pat);
+    let header_value = HeaderValue::from_str(&token).unwrap();
+    headers.insert(reqwest::header::AUTHORIZATION, header_value);
+
+    let res = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let bytes = res.bytes().map_err(|e| e.to_string())?;
+
+    let gip_dir = config_dir()?;
+    let archive_path = gip_dir.join(format!("{name}.tar.gz"));
+    std::fs::write(&archive_path, &bytes).map_err(|e| e.to_string())?;
+
+    let extract_dir = gip_dir.join(name);
+    if extract_dir.exists() {
+        std::fs::remove_dir_all(&extract_dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
+
+    let gz = GzDecoder::new(&bytes[..]);
+    let mut archive = Archive::new(gz);
+    archive.unpack(&extract_dir).map_err(|e| e.to_string())?;
+
+    let bin_path = extract_dir.join(name);
+
+    if !bin_path.exists() {
+        return Err(format!("binary {} not found after extraction", name));
+    }
+
+    let local_bin = dirs::home_dir()
+        .ok_or("cannot read home dir")?
+        .join(".local/bin");
+
+    std::fs::create_dir_all(&local_bin).map_err(|e| e.to_string())?;
+
+    let link_path = local_bin.join(name);
+    if link_path.exists() {
+        std::fs::remove_file(&link_path).map_err(|e| e.to_string())?;
+    }
+
+    symlink(&bin_path, &link_path).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -129,6 +201,16 @@ fn install(args: &[String], env_config: EnvVars) -> Result<(), String> {
             .find(|x| x.latest == "true")
             .ok_or("latest version not found")?,
     };
+
+    let file_url = format!(
+        "https://raw.githubusercontent.com/manish-ach/packages/refs/heads/main/{}/{}",
+        pkg.name, ver.version
+    );
+    let manifest_url = format!("{}/manifest.json", file_url);
+    let manifest: Manifest = fetch_manifest(&manifest_url, &env_config.pat)?;
+
+    let bin_url = format!("{}/{}", file_url, manifest.bin);
+    download_bin(&pkg.name, &bin_url, &env_config.pat)?;
 
     Ok(())
 }
