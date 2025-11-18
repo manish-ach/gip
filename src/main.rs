@@ -1,7 +1,7 @@
 use flate2::read::GzDecoder;
 use reqwest::{
     blocking::Client,
-    header::{HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
 use std::{
@@ -49,20 +49,48 @@ impl EnvVars {
     }
 }
 
+fn create_auth_client(pat: &str) -> Result<(Client, HeaderMap), String> {
+    let client = Client::new();
+    let mut headers = HeaderMap::new();
+    let token = format!("token {}", pat);
+    let header_value =
+        HeaderValue::from_str(&token).map_err(|e| format!("Invalid header value: {}", e))?;
+    headers.insert(AUTHORIZATION, header_value);
+    Ok((client, headers))
+}
+
+fn fetch_bytes(url: &str, pat: &str) -> Result<Vec<u8>, String> {
+    let (client, headers) = create_auth_client(pat)?;
+    let res = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|e| format!("Request Failes: {}", e))?;
+    res.bytes()
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("Failed to read response: {}", e))
+}
+
+fn fetch_json<T: serde::de::DeserializeOwned>(url: &str, pat: &str) -> Result<T, String> {
+    let bytes = fetch_bytes(url, pat)?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("JSON parse error: {}", e))
+}
+
 fn intro() {
     println!("Usage: program <command>");
     println!("Available commands: install, update, list, uninstall");
 }
 
 fn config_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("failed to read home dir")?;
-    let path: PathBuf = home.join(".gip");
+    let path = dirs::home_dir()
+        .ok_or("failed to read home dir")?
+        .join(".gip");
     Ok(path)
 }
 
 fn load_packages() -> Result<PackageDB, String> {
     let path = config_dir()?.join("packages.json");
-    let data = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let data = fs::read_to_string(path).map_err(|e| format!("Failed to read packages: {}", e))?;
     let parsed: PackageDB = serde_json::from_str(&data).map_err(|e| e.to_string())?;
     Ok(parsed)
 }
@@ -90,67 +118,26 @@ pub fn load_env(path: &str) -> io::Result<HashMap<String, String>> {
 }
 
 fn refresh_packages_db(env_config: &EnvVars) -> Result<(), String> {
-    let client = Client::new();
     let url = "https://raw.githubusercontent.com/manish-ach/packages/refs/heads/main/packages.json";
-    let mut headers = HeaderMap::new();
-    let header_value = HeaderValue::from_str(&format!("token {}", env_config.pat)).unwrap();
-    headers.insert(reqwest::header::AUTHORIZATION, header_value);
+    let bytes = fetch_bytes(url, &env_config.pat)?;
 
-    let res = client
-        .get(url)
-        .headers(headers)
-        .send()
-        .map_err(|e| e.to_string())?;
-    let bytes = res.bytes().map_err(|e| e.to_string())?;
-
-    let path = config_dir()?;
-    let package_file = path.join("packages.json");
-
-    std::fs::create_dir_all(package_file.parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(package_file, bytes).map_err(|e| e.to_string())?;
+    let package_file = config_dir()?.join("packages.json");
+    fs::create_dir_all(package_file.parent().unwrap())
+        .map_err(|e| format!("Failed to create directory: {}", e))?;
+    fs::write(package_file, bytes).map_err(|e| format!("Failed to write packages.json: {}", e))?;
 
     Ok(())
 }
 
-fn fetch_manifest<T: serde::de::DeserializeOwned>(url: &str, pat: &str) -> Result<T, String> {
-    let client = Client::new();
-    let mut headers = HeaderMap::new();
-    let token = format!("token {}", pat);
-    let header_value = HeaderValue::from_str(&token).unwrap();
-    headers.insert(reqwest::header::AUTHORIZATION, header_value);
-
-    let res = client
-        .get(url)
-        .headers(headers)
-        .send()
-        .map_err(|e| e.to_string())?;
-    let bytes = res.bytes().map_err(|e| e.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-}
-
 fn download_bin(name: &str, url: &str, pat: &str) -> Result<(), String> {
-    let client = Client::new();
-    let mut headers = HeaderMap::new();
-    let token = format!("token {}", pat);
-    let header_value = HeaderValue::from_str(&token).unwrap();
-    headers.insert(reqwest::header::AUTHORIZATION, header_value);
-
-    let res = client
-        .get(url)
-        .headers(headers)
-        .send()
-        .map_err(|e| e.to_string())?;
-    let bytes = res.bytes().map_err(|e| e.to_string())?;
-
+    let bytes = fetch_bytes(url, pat)?;
     let gip_dir = config_dir()?;
-    let archive_path = gip_dir.join(format!("{name}.tar.gz"));
-    std::fs::write(&archive_path, &bytes).map_err(|e| e.to_string())?;
-
     let extract_dir = gip_dir.join(name);
+
     if extract_dir.exists() {
-        std::fs::remove_dir_all(&extract_dir).map_err(|e| e.to_string())?;
+        fs::remove_dir_all(&extract_dir).map_err(|e| format!("Failed to remove old dir: {}", e))?;
     }
-    std::fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&extract_dir).map_err(|e| format!("Failed to create dir: {}", e))?;
 
     let gz = GzDecoder::new(&bytes[..]);
     let mut archive = Archive::new(gz);
@@ -165,15 +152,14 @@ fn download_bin(name: &str, url: &str, pat: &str) -> Result<(), String> {
     let local_bin = dirs::home_dir()
         .ok_or("cannot read home dir")?
         .join(".local/bin");
-
-    std::fs::create_dir_all(&local_bin).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&local_bin).map_err(|e| format!("Failed to create .local/bin: {}", e))?;
 
     let link_path = local_bin.join(name);
     if link_path.exists() {
-        std::fs::remove_file(&link_path).map_err(|e| e.to_string())?;
+        fs::remove_file(&link_path).map_err(|e| format!("Failed to remove old symlink: {}", e))?;
     }
 
-    symlink(&bin_path, &link_path).map_err(|e| e.to_string())?;
+    symlink(&bin_path, &link_path).map_err(|e| format!("Failed to create symlink: {}", e))?;
     Ok(())
 }
 
@@ -207,8 +193,7 @@ fn install(args: &[String], env_config: EnvVars) -> Result<(), String> {
         pkg.name, ver.version
     );
     let manifest_url = format!("{}/manifest.json", file_url);
-    let manifest: Manifest = fetch_manifest(&manifest_url, &env_config.pat)?;
-
+    let manifest: Manifest = fetch_json(&manifest_url, &env_config.pat)?;
     let bin_url = format!("{}/{}", file_url, manifest.bin);
     download_bin(&pkg.name, &bin_url, &env_config.pat)?;
 
@@ -216,9 +201,9 @@ fn install(args: &[String], env_config: EnvVars) -> Result<(), String> {
 }
 
 fn process(args: &[String]) -> Result<(), String> {
-    let path = config_dir()?;
-    let pat_file = path.join("pat.key");
-    let vars = load_env(pat_file.to_str().unwrap()).map_err(|e| e.to_string())?;
+    let pat_file = config_dir()?.join("pat.key");
+    let vars =
+        load_env(pat_file.to_str().unwrap()).map_err(|e| format!("failed to load PAT: {}", e))?;
     let env_config = EnvVars::from_map(vars)?;
 
     match args.get(1).map(String::as_str) {
@@ -239,5 +224,6 @@ fn main() {
         intro();
     } else if let Err(e) = process(&args) {
         eprintln!("Error: {e}");
+        std::process::exit(1);
     }
 }
